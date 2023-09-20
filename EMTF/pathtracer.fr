@@ -1,0 +1,742 @@
+#version 460 core
+out vec4 FragColor;
+out vec4 outdata;
+
+in vec2 coord;
+uniform samplerBuffer Triangles;
+uniform samplerBuffer Vertices;
+uniform samplerBuffer Nodes;
+uniform samplerBuffer Materials;
+uniform sampler2D lastframe;
+uniform float NodeStride;
+uniform float VertexStride;
+uniform float TriangleStride;
+uniform float MaterialStride;
+uniform vec3 WorldSpaceCameraPos;
+uniform vec3 WorldSpaceCameraDir;
+uniform float CameraFOV;
+uniform float CameraAspect;
+uniform float frame;
+uniform int bounce;
+
+
+uniform sampler2D KleeHair;
+uniform sampler2D KleeFace;
+uniform sampler2D KleeCloth;
+uniform sampler2D CubeHouseBasemap;
+uniform sampler2D LightBasemap;
+uniform sampler2D MirrorBasemap;
+int float2int(float f){
+	return int(f+0.1);
+}
+struct Vertex{
+	vec3 position;
+	vec2 uv;
+	vec3 normal;
+};
+struct Triangle{
+	Vertex p1;
+	Vertex p2;
+	Vertex p3;
+	float meshIndex;
+};
+
+struct Ray{
+	vec3 startPoint;
+	vec3 direction;
+};
+struct RayHit{
+	bool isInner;
+	bool isHit;
+	float distance;
+	vec3 hitPoint;
+	vec3 normal;
+	vec3 rayDir;
+	vec2 texcoord;
+	float meshIndex;
+};
+struct Material{
+	vec3 emissive;
+	vec3 baseColor;
+	float subsurface;
+	float metallic;
+	float specular;
+	float specularTint;
+	float roughness;
+	float anisotropic;
+	float sheen;
+	float sheenTint;
+	float clearcoat;
+	float clearcoatGloss;
+	float IOR;
+	float transmission;
+};
+struct Node{
+	int triangleIndex;
+	int l;
+	int r;
+	vec3 AA;
+	vec3 BB;
+};
+vec4 SampleMeshTexture(vec2 uv,float meshID){
+	int mid=float2int(meshID);
+	vec4 ret=vec4(1);
+	if(mid==0){
+		ret= texture(KleeHair,uv);
+	}
+	else if(mid==1){
+		ret= texture(KleeFace,uv);
+	}
+	else if(mid==2){
+		ret= texture(KleeCloth,uv);
+	}
+	else if(mid==3){
+		ret= texture(CubeHouseBasemap,uv);
+	}else if(mid==4||mid==5||mid==6||mid==7){
+		ret= texture(LightBasemap,uv);
+	}else if(mid==8){
+		ret=texture(LightBasemap,uv);
+	}
+	return ret;
+}
+
+int IndexNode(int id){
+	return id*float2int(NodeStride);
+}
+int IndexVertex(int id){
+	return id*float2int(VertexStride);
+}
+int IndexTriangle(int id){
+	return id*float2int(TriangleStride);
+}
+int IndexMaterial(int id){
+	return id*float2int(MaterialStride);
+}
+Material DecodeMaterial(int id){
+	Material ret;
+	vec3 p1=texelFetch(Materials,id).xyz;
+	vec3 p2=texelFetch(Materials,id+1).xyz;
+	vec3 p3=texelFetch(Materials,id+2).xyz;
+	vec3 p4=texelFetch(Materials,id+3).xyz;
+	vec3 p5=texelFetch(Materials,id+4).xyz;
+	vec3 p6=texelFetch(Materials,id+5).xyz;
+	ret.emissive=p1;
+	ret.baseColor=p2;
+	ret.subsurface=p3.x;
+	ret.metallic=p3.y;
+	ret.specular=p3.z;
+	ret.specularTint=p4.x;
+	ret.roughness=p4.y;
+	ret.anisotropic=p4.z;
+	ret.sheen=p5.x;
+	ret.sheenTint=p5.y;
+	ret.clearcoat=p5.z;
+	ret.clearcoatGloss=p6.x;
+	ret.IOR=p6.y;
+	ret.transmission=p6.z;
+	return ret;
+}
+RayHit CountRayHit(Triangle tri,Ray ray){
+	RayHit ret;
+	ret.distance=10000.;
+	ret.isHit=false;
+	ret.isInner=false;
+	ret.meshIndex=tri.meshIndex;
+	vec3 p1=tri.p1.position;
+	vec3 p2=tri.p2.position;
+	vec3 p3=tri.p3.position;
+	vec3 pN=normalize(cross(p2-p1,p3-p1));
+	if(dot(ray.direction,pN)>0){
+		pN=-pN;
+		ret.isInner=true;
+	}
+	if(abs(dot(pN,ray.direction))<0.00001f)return ret;
+	float dis=(dot(pN,p1)-dot(ray.startPoint,pN))/dot(ray.direction,pN);
+	if(dis<0.0007)return ret;
+	vec3 hit=ray.startPoint+ray.direction*dis;
+	vec3 cross1=cross(p2-p1,hit-p1);
+	vec3 cross2=cross(p3-p2,hit-p2);
+	vec3 cross3=cross(p1-p3,hit-p3);
+	float d1=dot(cross1,pN);
+	float d2=dot(cross2,pN);
+	float d3=dot(cross3,pN);
+	if(d1*d2>0&&d2*d3>0&&d1*d3>0){
+		ret.isHit=true;
+		ret.distance=dis;
+		ret.hitPoint=hit;
+		ret.rayDir=ray.direction;
+		float eps=0.000001;
+		float a=0,b=0,c=0;
+		if(abs(dot(pN,vec3(0,0,1)))>0.001&&abs(dot(pN,vec3(0,0,-1)))>0.001){
+			a=(-(hit.x-p2.x)*(p3.y-p2.y)+(hit.y-p2.y)*(p3.x-p2.x))/
+				(-(p1.x-p2.x-eps)*(p3.y-p2.y+eps)+(p1.y-p2.y+eps)*(p3.x-p2.x+eps));
+			b=(-(hit.x-p3.x)*(p1.y-p3.y)+(hit.y-p3.y)*(p1.x-p3.x))/
+				(-(p2.x-p3.x-eps)*(p1.y-p3.y+eps)+(p2.y-p3.y+eps)*(p1.x-p3.x+eps));
+			c=1-a-b;
+		}else{
+			a=(-(hit.x-p2.x)*(p3.z-p2.z)+(hit.z-p2.z)*(p3.x-p2.x))/
+				(-(p1.x-p2.x-eps)*(p3.z-p2.z+eps)+(p1.z-p2.z+eps)*(p3.x-p2.x+eps));
+			b=(-(hit.x-p3.x)*(p1.z-p3.z)+(hit.z-p3.z)*(p1.x-p3.x))/
+				(-(p2.x-p3.x-eps)*(p1.z-p3.z+eps)+(p2.z-p3.z+eps)*(p1.x-p3.x+eps));
+			c=1-a-b;
+		}
+		
+		ret.texcoord=tri.p1.uv*a+tri.p2.uv*b+tri.p3.uv*c;
+		ret.normal=tri.p1.normal*a+tri.p2.normal*b+tri.p3.normal*c;
+		ret.normal=normalize(ret.normal);
+		if(ret.isInner==true)ret.normal=-ret.normal;
+	}
+	return ret;
+}
+Ray GetRayFromScreenCoord(vec2 coord){
+	Ray ret;
+	ret.startPoint=WorldSpaceCameraPos;
+	float lane=1.0;
+	float height=lane*tan(CameraFOV/2.0);
+	float width=height*CameraAspect;
+	vec3 normCameraFront=normalize(WorldSpaceCameraDir);
+	vec3 normCameraRight=normalize(-cross(vec3(0,1.0,0),normCameraFront));
+	vec3 normCameraUp=normalize(cross(normCameraRight,normCameraFront));
+	vec3 dir=normCameraFront*lane+normCameraRight*width*coord.x+normCameraUp*height*coord.y;
+	ret.direction=normalize(dir);
+	return ret;
+}
+float IntersectBox(Ray r,vec3 aa,vec3 bb){
+	vec3 AA=aa;
+	vec3 BB=bb;
+	vec3 idir=1.0/r.direction;
+	vec3 far=(BB-r.startPoint)*idir;
+	vec3 near=(AA-r.startPoint)*idir;
+	vec3 mx=max(far,near);
+	vec3 mi=min(far ,near);
+	float mimx=min(mx.x,min(mx.y,mx.z));
+	float mxmi=max(mi.x,max(mi.y,mi.z));
+	float ret=-1;
+	if(mimx>=mxmi){
+		if(mxmi>0)ret= mxmi;
+		else ret= mimx;
+	}
+	return ret;
+}
+
+RayHit hitBVH(Ray ray){
+	int nodenum[512];
+	float nodedis[512];
+	int right=-1;
+
+	float debug=0;
+	RayHit ret;
+	//开始BVH计算射线交点，Node的stride是3，其中node[3k]是第k个节点的信息，x表示对应的三角形index，y表示左二子，z表示右儿子，node[3k+1]表示第k个节点的AA，node[3k+2]表示BB
+	ret.isHit=false;
+	ret.distance=100000.;
+	ret.isInner=false;
+	ret.hitPoint=vec3(0);
+	ret.normal=vec3(0);
+	ret.rayDir=vec3(0);
+	ret.texcoord=vec2(0);
+	ret.meshIndex=1; 
+
+	vec3 aa=texelFetch(Nodes,IndexNode(1)+1).xyz;
+	vec3 bb=texelFetch(Nodes,IndexNode(1)+2).xyz;
+	float dis=IntersectBox(ray,aa,bb);
+	//nodenum是一个栈，不会这都看不懂吧
+	right++;
+	nodenum[right]=1;
+	nodedis[right]=dis;
+	while(right>=0){
+		
+		//当前顶部的节点
+		vec4 tlr=texelFetch(Nodes,IndexNode(nodenum[right]));
+		//看上去很有道理但是会带来错误的剪枝，原因反正我是没想明白，笑死
+	//	if(nodedis[right]>=1.2*ret.distance){
+	//		right--;
+	//		continue;
+	//	}
+		
+		right--; 
+		//如果节点中包含的三角形数量小于一定程度，直接遍历里面所有的三角形，不仅是为了效率，同样是为了准确性。
+		if(tlr.x<0){//当前节点并非叶子节点
+			if(tlr.w>10){//当前节点中包含三角形数量大于10
+				int l=float2int(tlr.y);
+				int r=float2int(tlr.z);
+				vec3 aal=texelFetch(Nodes,IndexNode(l)+1).xyz;
+				vec3 bbl=texelFetch(Nodes,IndexNode(l)+2).xyz;
+				vec3 aar=texelFetch(Nodes,IndexNode(r)+1).xyz;
+				vec3 bbr=texelFetch(Nodes,IndexNode(r)+2).xyz;
+				float disl=IntersectBox(ray,aal,bbl);
+				float disr=IntersectBox(ray,aar,bbr);
+				if(disl>0&&disr>0){
+					if(disl>disr){
+							right++;
+							nodenum[right]=l;
+							nodedis[right]=disl;
+							right++;
+							nodenum[right]=r;
+							nodedis[right]=disr;
+					}else{
+							right++;
+							nodenum[right]=r;
+							nodedis[right]=disr;
+							right++;
+							nodenum[right]=l;
+							nodedis[right]=disl;
+					}
+
+				} 
+				if(disl>0.0&&disr<=0.0){
+					right++;
+					nodenum[right]=l;
+					nodedis[right]=disl;
+				}
+				if(disr>0.0&&disl<=0.0){
+					right++;
+					nodenum[right]=r;
+					nodedis[right]=disr;
+				}
+			}else{//当前节点中包含三角形数量小于10，这时将所有孩子全部入栈。
+				int l=float2int(tlr.y);
+				int r=float2int(tlr.z);
+				right++;
+				nodenum[right]=l;
+				nodedis[right]=0;
+				right++;
+				nodenum[right]=r;
+				nodedis[right]=0;
+			}
+		}else{
+			debug=1;
+			int trid=float2int(tlr.x);
+			vec4 vids=texelFetch(Triangles,IndexTriangle(trid));
+			Triangle tri;
+			Vertex v1;
+			v1.position=texelFetch(Vertices,IndexVertex(float2int(vids.x))).xyz;
+			v1.uv=texelFetch(Vertices,IndexVertex(float2int(vids.x))+1).xy;
+			v1.normal=texelFetch(Vertices,IndexVertex(float2int(vids.x))+2).xyz;
+			Vertex v2;
+			v2.position=texelFetch(Vertices,IndexVertex(float2int(vids.y))).xyz;
+			v2.uv=texelFetch(Vertices,IndexVertex(float2int(vids.y))+1).xy;
+			v2.normal=texelFetch(Vertices,IndexVertex(float2int(vids.y))+2).xyz;
+			Vertex v3;
+			v3.position=texelFetch(Vertices,IndexVertex(float2int(vids.z))).xyz;
+			v3.uv=texelFetch(Vertices,IndexVertex(float2int(vids.z))+1).xy;
+			v3.normal=texelFetch(Vertices,IndexVertex(float2int(vids.z))+2).xyz;
+			tri.p1=v1;
+			tri.p2=v2;
+			tri.p3=v3;
+			tri.meshIndex=vids.w;
+			RayHit hit=CountRayHit(tri,ray);
+			if(hit.isHit==true&&hit.distance<ret.distance){
+				ret=hit;
+			}
+		}
+	}
+//	ret.distance=debug;
+	return ret;
+}
+// 1 ~ 8 维的 sobol 生成矩阵
+const uint V[8*32] = {
+    2147483648, 1073741824, 536870912, 268435456, 134217728, 67108864, 33554432, 16777216, 8388608, 4194304, 2097152, 1048576, 524288, 262144, 131072, 65536, 32768, 16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1,
+    2147483648, 3221225472, 2684354560, 4026531840, 2281701376, 3422552064, 2852126720, 4278190080, 2155872256, 3233808384, 2694840320, 4042260480, 2290614272, 3435921408, 2863267840, 4294901760, 2147516416, 3221274624, 2684395520, 4026593280, 2281736192, 3422604288, 2852170240, 4278255360, 2155905152, 3233857728, 2694881440, 4042322160, 2290649224, 3435973836, 2863311530, 4294967295,
+    2147483648, 3221225472, 1610612736, 2415919104, 3892314112, 1543503872, 2382364672, 3305111552, 1753219072, 2629828608, 3999268864, 1435500544, 2154299392, 3231449088, 1626210304, 2421489664, 3900735488, 1556135936, 2388680704, 3314585600, 1751705600, 2627492864, 4008611328, 1431684352, 2147543168, 3221249216, 1610649184, 2415969680, 3892340840, 1543543964, 2382425838, 3305133397,
+    2147483648, 3221225472, 536870912, 1342177280, 4160749568, 1946157056, 2717908992, 2466250752, 3632267264, 624951296, 1507852288, 3872391168, 2013790208, 3020685312, 2181169152, 3271884800, 546275328, 1363623936, 4226424832, 1977167872, 2693105664, 2437829632, 3689389568, 635137280, 1484783744, 3846176960, 2044723232, 3067084880, 2148008184, 3222012020, 537002146, 1342505107,
+    2147483648, 1073741824, 536870912, 2952790016, 4160749568, 3690987520, 2046820352, 2634022912, 1518338048, 801112064, 2707423232, 4038066176, 3666345984, 1875116032, 2170683392, 1085997056, 579305472, 3016343552, 4217741312, 3719483392, 2013407232, 2617981952, 1510979072, 755882752, 2726789248, 4090085440, 3680870432, 1840435376, 2147625208, 1074478300, 537900666, 2953698205,
+    2147483648, 1073741824, 1610612736, 805306368, 2818572288, 335544320, 2113929216, 3472883712, 2290089984, 3829399552, 3059744768, 1127219200, 3089629184, 4199809024, 3567124480, 1891565568, 394297344, 3988799488, 920674304, 4193267712, 2950604800, 3977188352, 3250028032, 129093376, 2231568512, 2963678272, 4281226848, 432124720, 803643432, 1633613396, 2672665246, 3170194367,
+    2147483648, 3221225472, 2684354560, 3489660928, 1476395008, 2483027968, 1040187392, 3808428032, 3196059648, 599785472, 505413632, 4077912064, 1182269440, 1736704000, 2017853440, 2221342720, 3329785856, 2810494976, 3628507136, 1416089600, 2658719744, 864310272, 3863387648, 3076993792, 553150080, 272922560, 4167467040, 1148698640, 1719673080, 2009075780, 2149644390, 3222291575,
+    2147483648, 1073741824, 2684354560, 1342177280, 2281701376, 1946157056, 436207616, 2566914048, 2625634304, 3208642560, 2720006144, 2098200576, 111673344, 2354315264, 3464626176, 4027383808, 2886631424, 3770826752, 1691164672, 3357462528, 1993345024, 3752330240, 873073152, 2870150400, 1700563072, 87021376, 1097028000, 1222351248, 1560027592, 2977959924, 23268898, 437609937
+};
+
+// 格林码 
+uint grayCode(uint i) {
+	return i ^ (i>>1);
+}
+
+// 生成第 d 维度的第 i 个 sobol 数
+float sobol(uint d, uint i) {
+    uint result = 0;
+    uint offset = d * 32;
+    for(uint j = 0; i>0; i >>= 1, j++) 
+        if(i%2==1)
+            result ^= V[(j+offset)];
+
+    return float(result) * (1.0f/float(0xFFFFFFFFU));
+}
+
+// 生成第 i 帧的第 b 次反弹需要的二维随机向量
+vec2 sobolVec2(uint i, uint b) {
+    float u = sobol(b*2, grayCode(i));
+    float v = sobol(b*2+1, grayCode(i));
+    return vec2(u, v);
+}
+
+uint seed = uint(
+    uint((coord.x * 0.5 + 0.5) * 512)  * uint(1973) + 
+    uint((coord.y * 0.5 + 0.5) * 512) * uint(9277) + 
+    uint(frame) * uint(26699)) | uint(1);
+
+uint wang_hash(inout uint seed) {
+    seed = uint(seed ^ uint(61)) ^ uint(seed >> uint(16));
+    seed *= uint(9);
+    seed = seed ^ (seed >> 4);
+    seed *= uint(0x27d4eb2d);
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+ 
+float rand() {
+    return float(wang_hash(seed)) / 4294967296.0;
+}
+vec2 CranleyPattersonRotation(vec2 p) {
+    uint pseed = uint(
+        uint((coord.x * 0.5 + 0.5) * 512)  * uint(1973) + 
+        uint((coord.y * 0.5 + 0.5) * 512) * uint(9277) + 
+        uint(114514/1919) * uint(26699)) | uint(1);
+    
+    float u = float(wang_hash(pseed)) / 4294967296.0;
+    float v = float(wang_hash(pseed)) / 4294967296.0;
+
+    p.x += u;
+    if(p.x>1) p.x -= 1;
+    if(p.x<0) p.x += 1;
+
+    p.y += v;
+    if(p.y>1) p.y -= 1;
+    if(p.y<0) p.y += 1;
+
+    return p;
+}
+vec3 toNormalHemisphere(vec3 v,vec3 N){
+	N=normalize(N);
+	vec3 tmp=vec3(1,0,0);
+	if(abs(N.x)>0.999)tmp=vec3(0,0,1);
+	vec3 tangent=normalize(cross(N,tmp));
+	vec3 bitangent=normalize(cross(N,tangent));
+	return v.x*tangent+v.y*bitangent+v.z*N;
+}
+vec3 SampleHemisphere(float x,float y){
+	float z=x;
+	float r=max(0,sqrt(1-z*z));
+	float phi=2.0*3.141592657*y;
+	return vec3(r*cos(phi),r*sin(phi),z);
+}
+vec3 SampleCosineHemisphere(float x1,float x2,vec3 N){
+	N=normalize(N);
+	float r=sqrt(x1);
+	float theta=x2*2.0*3.141592657;
+	float x=r*cos(theta);
+	float y=r*sin(theta);
+	float z=sqrt(1.0-x*x-y*y);
+	vec3 L=toNormalHemisphere(vec3(x,y,z),N);
+	return L;
+}
+vec3 SampleGTR2(float x1,float x2,vec3 V,vec3 N,float roughness){
+	V=normalize(V);
+	N=normalize(N);
+	float alpha=max(0.001,roughness*roughness);
+	float phi=2.0*3.141592657*x1;
+	float sinh=sin(phi);
+	float cosh=cos(phi);
+	float costhetah=sqrt((1.0-x2)/(1.0+(alpha*alpha-1.0)*x2));
+	float sinthetah=sqrt(max(0.0,1.0-costhetah*costhetah));
+	vec3 H=vec3(sinthetah*cosh,sinthetah*sinh,costhetah);
+	H=toNormalHemisphere(H,N);
+	vec3 L=reflect(-V,H);
+	L=normalize(L);
+	return L;
+}
+
+
+float Fresnel(float u){
+	float m=clamp(1-u,0,1);
+	float m2=m*m;
+	return m2*m2*m;
+}
+float g1(float NoH,float a){
+	if(a>=1.0)return 1.0/3.141592657;
+	float a2=a*a;
+	float t=1.0+(a2-1.0)*NoH*NoH;
+	return (a2-1.0)/(3.141592657*log(a2)*t);
+}
+float g2(float NoH,float a){
+	float a2=a*a;
+	float t=1.0+(a2-1.0)*NoH*NoH;
+	return a2/(3.141592657*t*t);
+}
+float ggx(float NoV,float alpha){
+	float a=alpha*alpha;
+	float b=NoV*NoV;
+	return 1.0/(NoV+sqrt(a+b-a*b));
+}
+
+vec3 BRDFDiffuse(vec3 V,vec3 N,vec3 L,in Material mat){
+	V=normalize(V);
+	N=normalize(N);
+	L=normalize(L);
+	float NoL=dot(N,L);
+	float NoV=dot(N,V);
+	if(NoL<0||NoV<0)return vec3(0);//背面
+	vec3 H=normalize(L+V);
+	float NoH=dot(N,H);
+	float LoH=dot(L,H);
+	vec3 base=mat.baseColor;
+	//漫反射
+	float fd90=0.5+2.0*LoH*LoH*mat.roughness;
+	float fl=Fresnel(NoL);
+	float fv=Fresnel(NoV);
+	float fd=mix(1.0,fd90,fl)*mix(1.0,fd90,fv);
+	//次表面散射
+	float fss90=LoH*LoH*mat.roughness;
+	float fss=mix(1.0,fss90,fl)*mix(1.0,fss90,fv);
+	float ss=1.25*(fss*(1.0/(NoL+NoV)-0.5)+0.5);
+	vec3 diffuse=(1.0/3.141592657)*mix(fd,ss,mat.subsurface)*base;
+	
+	diffuse=max(vec3(0.0001,0.0001,0.0001),diffuse);
+	return diffuse*(1.0-mat.metallic);
+}
+vec3 BRDFSpecular(vec3 V,vec3 N,vec3 L,in Material mat){
+	V=normalize(V);
+	N=normalize(N);
+	L=normalize(L);
+	float NoL=dot(N,L);
+	float NoV=dot(N,V);
+	if(NoL<0||NoV<0)return vec3(0);//背面
+	vec3 H=normalize(L+V);
+	float NoH=dot(N,H);
+	float LoH=dot(L,H);
+	vec3 base=mat.baseColor;
+	//镜面反射
+	vec3 mir=mat.baseColor;
+	float lumi=0.3*mir.r+0.6*mir.g+0.1*mir.b;
+	vec3 spectint=(lumi>0)?(mir/lumi):(vec3(1));
+	vec3 spec=mat.specular*mix(vec3(1),spectint,mat.specularTint);
+	vec3 specular=mix(0.08*spec,mir,mat.metallic);
+
+
+	float alpha=max(0.0001,mat.roughness*mat.roughness);
+	float ds=g2(NoH,alpha);
+	float fh=Fresnel(LoH);
+	vec3 fs=mix(specular,vec3(1),fh);
+	float gs=ggx(NoL,mat.roughness)*ggx(NoV,mat.roughness);
+	specular=gs*fs*ds;
+ 	specular=clamp(specular,0.0,10.0);
+	specular=max(vec3(0.0001,0.0001,0.0001),specular);
+	return specular;
+}
+float GetBRDFPdf(vec3 V,vec3 N,vec3 L,in Material material){
+	V=normalize(V);
+	N=normalize(N);
+	L=normalize(L);
+	float NoL=dot(N,L);
+	float NoV=dot(N,V);
+	if(NoL<0||NoV<0)return 0;
+	vec3 H=normalize(L+V);
+	float NoH=dot(N,H);
+	float LoH=dot(L,H);
+	float alpha=max(0.001,material.roughness*material.roughness);
+	float ds=g2(NoH,alpha);
+	float pdiffuse=NoH/3.141592657;
+	float pspecular=ds*NoH/(4.0*dot(L,H));
+	float rdiffuse=1-material.metallic;
+	float rspecular=1;
+	float rsum=rdiffuse+rspecular;
+	float pd=rdiffuse/rsum;
+	float ps=rspecular/rsum;
+	float pdf=pd*pdiffuse+ps*pspecular;
+	pdf=max(0.0000001,pdf);
+	return pdf;
+}
+vec3 pathTracing(RayHit from,int maxbounce){
+	vec3 Lo=vec3(0);
+	vec3 last=vec3(1);
+	for(int i=0;i<maxbounce;i++){
+		Material baseMat=DecodeMaterial(IndexMaterial(float2int(from.meshIndex)));
+		//计算用于重要性采样的概率分布
+		float rdiffuse=1.0-baseMat.metallic;
+		float rspecular=1;
+		float rsum=rdiffuse+rspecular;
+		float pdiffuse=rdiffuse/rsum;
+		float pspecular=rspecular/rsum+pdiffuse;
+
+		uint frameT=uint(frame)+1;
+		vec2 uv=sobolVec2(frameT,i%4);
+		uv=CranleyPattersonRotation(uv);
+
+		float x3=rand();
+
+		vec3 wi=vec3(0);
+		if(x3<=pdiffuse)
+			wi=SampleCosineHemisphere(uv.x,uv.y,from.normal);//逆路之后是L方向
+		else if(x3<pspecular){
+			wi=SampleGTR2(uv.x,uv.y,-from.rayDir,from.normal,baseMat.roughness);
+		}
+		Ray randomRay;
+		randomRay.startPoint=from.hitPoint;
+		randomRay.direction=wi;
+		
+		RayHit hit=hitBVH(randomRay);
+		//float pdf=1.0/(2.0*3.141592657);
+		// float co=max(0,dot(-from.rayDir,from.normal));
+		// float ci=max(0,dot(randomRay.direction,from.normal));
+		float NoL=dot(from.normal,wi);
+		if(NoL<=0.0)break;
+		baseMat.baseColor=baseMat.baseColor*SampleMeshTexture(from.texcoord,from.meshIndex).xyz;
+		vec3 diffuse=BRDFDiffuse(-from.rayDir,from.normal,wi,baseMat);
+		vec3 specular=BRDFSpecular(-from.rayDir,from.normal,wi,baseMat);
+		
+		vec3 fr=diffuse+specular;
+		float fpdf=GetBRDFPdf(-from.rayDir,from.normal,wi,baseMat);
+		if(fpdf<=0.0)break;
+		
+		//vec3 fr=baseMat.baseColor*SampleMeshTexture(from.texcoord,from.meshIndex).xyz/3.141592657;
+		// vec3 fr=baseMat.baseColor*(from.normal.xyz*0.5+0.5)/3.141592657;
+
+		if(hit.isHit==false){
+			Lo+=last*vec3(0.7,0.6,0.2)*fr*NoL/fpdf;
+			break;
+		}
+		Material newMat=DecodeMaterial(IndexMaterial(float2int(hit.meshIndex)));
+		
+		vec3 emissive=newMat.emissive;
+		Lo+=last*emissive*fr*NoL/fpdf;
+		from=hit;
+		last*=fr*NoL/fpdf;
+	//	Lo=min(Lo,vec3(1,1,1));
+//		Lo=max(Lo,vec3(0,0,0));
+	}
+	return Lo;
+}
+vec3 GetPathNoTracingColor(Ray ray){
+	RayHit ht=hitBVH(ray);
+	vec3 ret=vec3(0);
+	if(ht.isHit==true){
+		Material base=DecodeMaterial(IndexMaterial(float2int(ht.meshIndex)));
+		ret=base.baseColor*SampleMeshTexture(ht.texcoord,ht.meshIndex).xyz;
+		// ret=vec3(1,1,1)*base.specular;
+	}else{
+		ret=vec3(0.7,0.6,0.2);
+	}
+	return ret;
+}
+
+vec3 GetPathTracingColor(Ray ray){
+	RayHit ht=hitBVH(ray);
+	//RayHit ht;
+	// ht.isHit=true;
+	// ht.meshIndex=5;
+	vec3 ret=vec3(0);
+	if(ht.isHit==true){
+		Material baseMat=DecodeMaterial(IndexMaterial(float2int(ht.meshIndex)));
+	//	return vec3(ht.meshIndex/5);
+		// return vec3(0);
+		ret= baseMat.emissive+pathTracing(ht,bounce);
+	}else{
+		ret=vec3(0.7,0.6,0.2);
+	}
+	return ret;
+}
+
+RayHit BruteForce(Ray ray){
+	RayHit ret;
+	ret.isHit=false;
+	ret.distance=100000.;
+	ret.isInner=false;
+	ret.hitPoint=vec3(0);
+	ret.normal=vec3(0);
+	ret.rayDir=vec3(0);
+	ret.texcoord=vec2(0);
+	ret.meshIndex=1;
+	for(int i=0;i<12;i+=float2int(TriangleStride)){
+		Triangle tri;
+		vec4 rd=texelFetch(Triangles,i);
+		tri.meshIndex=rd.w;
+		vec4 v1Position=texelFetch(Vertices,float2int(rd.x*VertexStride));
+		vec4 v1UV=texelFetch(Vertices,float2int(rd.x*VertexStride+1));
+		vec4 v1Normal=texelFetch(Vertices,float2int(rd.x*VertexStride+2));
+		Vertex v1;
+		v1.position=v1Position.xyz;
+		v1.uv=v1UV.xy;
+		v1.normal=v1Normal.xyz;
+		vec4 v2Position=texelFetch(Vertices,float2int(rd.y*VertexStride));
+		vec4 v2UV=texelFetch(Vertices,float2int(rd.y*VertexStride+1));
+		vec4 v2Normal=texelFetch(Vertices,float2int(rd.y*VertexStride+2));
+		Vertex v2;
+		v2.position=v2Position.xyz;
+		v2.uv=v2UV.xy;
+		v2.normal=v2Normal.xyz;
+		vec4 v3Position=texelFetch(Vertices,float2int(rd.z*VertexStride));
+		vec4 v3UV=texelFetch(Vertices,float2int(rd.z*VertexStride+1));
+		vec4 v3Normal=texelFetch(Vertices,float2int(rd.z*VertexStride+2));
+		Vertex v3;
+		v3.position=v3Position.xyz;
+		v3.uv=v3UV.xy;
+		v3.normal=v3Normal.xyz;
+		tri.p1=v1;
+		tri.p2=v2;
+		tri.p3=v3;
+		RayHit hit=CountRayHit(tri,ray);
+	
+		if(hit.isHit==true&&hit.distance<ret.distance){
+			ret=hit;
+			// ret.normal=vec3(float(i),float(i),float(i))/12.0;
+
+		}
+	}
+	return ret;
+}
+// vec3 BruteForceV(Ray ray){
+// 	float mx=0.;
+// 	for(int i=0;i<=100*int(VertexStride);i+=int(VertexStride)){
+// 		vec3 position=texelFetch(Vertices,i*int(VertexStride)).xyz;
+// 		vec3 dir=normalize(position-WorldSpaceCameraPos);
+// 		mx=max(mx,pow(max(0,dot(dir,ray.direction)),15));
+// 	}
+// 	return vec3(mx,mx,mx);
+
+	
+// }
+
+// vec3 debug(vec2 coord){
+// 	if(coord.x<-0.3)
+// 		return vec3(0,texelFetch(Nodes,3).y/3,0);
+// 	if(coord.x<0.3)
+// 		return vec3(0,texelFetch(Nodes,4).y/3,0);
+// 	if(coord.x<1)
+// 		return vec3(0,texelFetch(Nodes,5).y/3,0);
+// }
+
+
+void main(){
+	 Ray ray=GetRayFromScreenCoord(coord);
+	// RayHit hit=BruteForce(ray);
+	
+	vec4 last=texture(lastframe,coord.xy*0.5+0.5);
+
+	int debug=0;
+	if(debug==0){
+//Formal
+		vec4 pt=vec4(GetPathTracingColor(ray),1);
+		outdata=mix(last,pt,1.0/(frame+1.0));
+	}else{
+//Debug
+		vec4 pt=vec4(GetPathNoTracingColor(ray),1);
+		outdata=pt;
+	}
+
+	// outdata=vec4(hit.normal*0.5+0.5,1);
+
+// vec3 x=texelFetch(Nodes,IndexNode(stktop())+1).xyz;
+// 	vec3 aa=texelFetch(Nodes,IndexNode(stktop())+1).xyz;
+// 	vec3 bb=texelFetch(Nodes,IndexNode(stktop())+2).xyz;
+// 	float dis=IntersectBox(ray,aa,bb);
+// 	// vec4 last=texture(lastframe,coord*0.5+0.5);
+// 	stkpush(1,1);
+// 	stkpop();
+// 	stkclear();
+
+// //	vec3 aa=texelFetch(Nodes,IndexNode(stktop())+2).xyz;
+// 	float y=stkdis();
+// 	int z=2;
+// 	z=IndexNode(z);
+// 	z=float2int(y);
+// //	float sds=float(nodenum[stktop()+2]+2);
+// 	outdata=vec4(right+1.5,right+1.5,right+1.5,1);
+}
